@@ -1,1 +1,6 @@
 .env
+.claude/
+.idea/
+__pycache__/
+STATE.md
+CLAUDE.md

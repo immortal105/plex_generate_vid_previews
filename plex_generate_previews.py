@@ -6,14 +6,16 @@ import shutil
 import glob
 import os
 import struct
+import json
 import urllib3
 import array
 import time
 import http.client
 import xml.etree.ElementTree
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
@@ -109,18 +111,31 @@ logger.add(
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Plex Interface
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=0.3,
-    status_forcelist=[500, 502, 503, 504],
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session = requests.Session()
-session.verify = False
-session.mount("http://", adapter)
-session.mount("https://", adapter)
-plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=PLEX_TIMEOUT, session=session)
+# Plex connection is lazy-initialized in __main__ (main process) and _init_worker (worker processes)
+# to avoid re-creating connections on every ProcessPoolExecutor worker spawn
+plex = None
+_worker_plex = None
+
+
+def _create_plex_connection():
+    """Create a new PlexServer connection with retry logic."""
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.3,
+        status_forcelist=[500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    sess = requests.Session()
+    sess.verify = False
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return PlexServer(PLEX_URL, PLEX_TOKEN, timeout=PLEX_TIMEOUT, session=sess)
+
+
+def _init_worker():
+    """Called once per worker process at startup to create a single PlexServer connection."""
+    global _worker_plex
+    _worker_plex = _create_plex_connection()
 
 # Monkey patch XML parsing to capture raw responses on parsing errors
 import plexapi.utils as utils
@@ -163,6 +178,7 @@ def detect_gpu():
         logger.debug(f"Error initializing NVIDIA GPU detection {e}. NVIDIA GPUs will not be detected.")
 
     # Check for AMD GPUs
+    amdsmi_interface = None
     try:
         from amdsmi import amdsmi_interface
         amdsmi_interface.amdsmi_init()
@@ -173,10 +189,6 @@ def detect_gpu():
                 processor_type = amdsmi_interface.amdsmi_get_processor_type(device)
                 if processor_type == amdsmi_interface.AMDSMI_PROCESSOR_TYPE_GPU:
                     found = True
-        try:
-            amdsmi_interface.amdsmi_shut_down()
-        except:
-            pass  # Ignore shutdown errors
         if found:
                 vaapi_device_dir = "/dev/dri"
                 if os.path.exists(vaapi_device_dir):
@@ -193,10 +205,11 @@ def detect_gpu():
     except Exception as e:
         logger.debug(f"Error initializing AMD GPU detection: {e}. AMD GPUs will not be detected.")
     finally:
-        try:
-            amdsmi_interface.amdsmi_shut_down()
-        except:
-            pass  # Ignore shutdown errors if init failed
+        if amdsmi_interface is not None:
+            try:
+                amdsmi_interface.amdsmi_shut_down()
+            except Exception:
+                pass
 
     # Check for Intel iGPU
     try:
@@ -271,12 +284,49 @@ def get_intel_ffmpeg_processes():
     
     return intel_gpu_processes
 
+_heuristic_cache: dict = {}
+_HEURISTIC_CACHE_PATH = Path(TMP_FOLDER).parent / '.heuristic_skip_cache.json'
+
+
+def _load_heuristic_cache():
+    """Load cached heuristic probe results from disk."""
+    global _heuristic_cache
+    try:
+        if _HEURISTIC_CACHE_PATH.exists():
+            _heuristic_cache = json.loads(_HEURISTIC_CACHE_PATH.read_text())
+    except Exception:
+        _heuristic_cache = {}
+
+
+def _save_heuristic_cache():
+    """Persist heuristic probe results to disk."""
+    try:
+        _HEURISTIC_CACHE_PATH.write_text(json.dumps(_heuristic_cache))
+    except Exception:
+        pass
+
+
+def _heuristic_cache_key(video_file: str) -> str:
+    """Generate a cache key from file path, size, and modification time."""
+    try:
+        stat = os.stat(video_file)
+        return f"{video_file}|{stat.st_size}|{stat.st_mtime}"
+    except OSError:
+        return video_file
+
+
 def heuristic_allows_skip(ffmpeg_path: str, video_file: str) -> bool:
     """
     Using the first 10 frames of file to decide if -skip_frame:v nokey is safe.
     Uses -err_detect explode + -xerror to bail immediately on the first decode error.
     Returns True if the probe succeeds, else False. Logs a short tail if available.
+    Results are cached to disk keyed by (path, size, mtime) to avoid re-probing.
     """
+    key = _heuristic_cache_key(video_file)
+    if key in _heuristic_cache:
+        logger.debug(f"skip_frame probe cached result={_heuristic_cache[key]} for {video_file}")
+        return _heuristic_cache[key]
+
     null_sink = "NUL" if os.name == "nt" else "/dev/null"
     cmd = [
         ffmpeg_path,
@@ -298,6 +348,9 @@ def heuristic_allows_skip(ffmpeg_path: str, video_file: str) -> bool:
         logger.debug(f"skip_frame probe FAILED at 0s: rc={proc.returncode} msg={last}")
     else:
         logger.debug("skip_frame probe OK at 0s")
+
+    _heuristic_cache[key] = ok
+    _save_heuristic_cache()
     return ok
 
 
@@ -310,24 +363,9 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
     if media_info.video_tracks:
         if media_info.video_tracks[0].hdr_format != "None" and media_info.video_tracks[0].hdr_format is not None:
             vf_parameters = "fps=fps={}:round=up,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
-    args = [
-        FFMPEG_PATH, "-loglevel", "info",
-        "-threads:v", "1",  # fix: was '-threads:0 1'
-    ]
-
-    use_skip = heuristic_allows_skip(FFMPEG_PATH, video_file)
-    if use_skip:
-        args += ["-skip_frame:v", "nokey"]
-
-    args += [
-        "-i", video_file, "-an", "-sn", "-dn",
-        "-q:v", str(THUMBNAIL_QUALITY),
-        "-vf", vf_parameters,
-        '{}/img-%06d.jpg'.format(output_folder)
-    ]
-
     start = time.time()
     hw = False
+    hwaccel_opts = []
 
     # Only attempt GPU processing if GPU_THREADS > 0
     if GPU_THREADS > 0:
@@ -346,45 +384,48 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
                     logger.debug('Hit limit on GPU threads, defaulting back to CPU')
                 if len(gpu_ffmpeg) < GPU_THREADS or CPU_THREADS == 0:
                     hw = True
-                    args.insert(5, "-hwaccel")
-                    args.insert(6, "cuda")
+                    hwaccel_opts = ["-hwaccel", "cuda"]
         else:
             # AMD or Intel
-            if gpu == 'INTEL': 
+            if gpu == 'INTEL':
                 gpu_ffmpeg = get_intel_ffmpeg_processes()
             else:
                 gpu_ffmpeg = get_amd_ffmpeg_processes()
-                
+
             logger.debug('Counted {} ffmpeg GPU threads running'.format(len(gpu_ffmpeg)))
             if len(gpu_ffmpeg) > GPU_THREADS:
                 logger.debug('Hit limit on GPU threads, defaulting back to CPU')
 
             if len(gpu_ffmpeg) < GPU_THREADS or CPU_THREADS == 0:
                 hw = True
-                args.insert(5, "-hwaccel")
-                args.insert(6, "vaapi")
-                args.insert(7, "-vaapi_device")
-                args.insert(8, gpu_device_path)
-                # Adjust vf_parameters for Intel 
+                hwaccel_opts = ["-hwaccel", "vaapi", "-vaapi_device", gpu_device_path]
+                # Adjust vf_parameters for VAAPI hardware scaling
                 if gpu == 'INTEL':
                     vf_parameters = vf_parameters.replace(
                         "scale=w=320:h=240:force_original_aspect_ratio=decrease",
                         "format=nv12,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease,hwdownload,format=nv12")
-                else: 
-                # Adjust vf_parameters for AMD VAAPI
+                else:
+                    # AMD VAAPI
                     vf_parameters = vf_parameters.replace(
                         "scale=w=320:h=240:force_original_aspect_ratio=decrease",
                         "format=nv12|vaapi,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease")
-                
-                args[args.index("-vf") + 1] = vf_parameters
+
+    use_skip = heuristic_allows_skip(FFMPEG_PATH, video_file)
+    skip_opts = ["-skip_frame:v", "nokey"] if use_skip else []
+
+    args = (
+        [FFMPEG_PATH, "-loglevel", "info", "-threads:v", "1"]
+        + hwaccel_opts
+        + skip_opts
+        + ["-i", video_file, "-an", "-sn", "-dn",
+           "-q:v", str(THUMBNAIL_QUALITY),
+           "-vf", vf_parameters,
+           '{}/img-%06d.jpg'.format(output_folder)]
+    )
 
     logger.debug('Running ffmpeg')
     logger.debug(' '.join(args))
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    # Allow time for it to start
-    time.sleep(1)
-
     out, err = proc.communicate()
     if proc.returncode != 0:
         err_lines = err.decode('utf-8', 'ignore').split('\n')[-5:]
@@ -403,7 +444,7 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
 
     # Optimize and Rename Images
     for image in glob.glob('{}/img*.jpg'.format(output_folder)):
-        frame_no = int(os.path.basename(image).strip('-img').strip('.jpg')) - 1
+        frame_no = int(os.path.basename(image).removeprefix('img-').removesuffix('.jpg')) - 1
         frame_second = frame_no * PLEX_BIF_FRAME_INTERVAL
         os.rename(image, os.path.join(output_folder, '{:010d}.jpg'.format(frame_second)))
 
@@ -422,39 +463,44 @@ def generate_bif(bif_filename, images_path):
     images = [img for img in os.listdir(images_path) if os.path.splitext(img)[1] == '.jpg']
     images.sort()
 
-    f = open(bif_filename, "wb")
-    array.array('B', magic).tofile(f)
-    f.write(struct.pack("<I", version))
-    f.write(struct.pack("<I", len(images)))
-    f.write(struct.pack("<I", 1000 * PLEX_BIF_FRAME_INTERVAL))
-    array.array('B', [0x00 for x in range(20, 64)]).tofile(f)
+    with open(bif_filename, "wb") as f:
+        array.array('B', magic).tofile(f)
+        f.write(struct.pack("<I", version))
+        f.write(struct.pack("<I", len(images)))
+        f.write(struct.pack("<I", 1000 * PLEX_BIF_FRAME_INTERVAL))
+        array.array('B', [0x00 for x in range(20, 64)]).tofile(f)
 
-    bif_table_size = 8 + (8 * len(images))
-    image_index = 64 + bif_table_size
-    timestamp = 0
+        bif_table_size = 8 + (8 * len(images))
+        image_index = 64 + bif_table_size
+        timestamp = 0
 
-    # Get the length of each image
-    for image in images:
-        statinfo = os.stat(os.path.join(images_path, image))
-        f.write(struct.pack("<I", timestamp))
+        # Get the length of each image
+        for image in images:
+            statinfo = os.stat(os.path.join(images_path, image))
+            f.write(struct.pack("<I", timestamp))
+            f.write(struct.pack("<I", image_index))
+            timestamp += 1
+            image_index += statinfo.st_size
+
+        f.write(struct.pack("<I", 0xffffffff))
         f.write(struct.pack("<I", image_index))
-        timestamp += 1
-        image_index += statinfo.st_size
 
-    f.write(struct.pack("<I", 0xffffffff))
-    f.write(struct.pack("<I", image_index))
+        # Now copy the images
+        for image in images:
+            with open(os.path.join(images_path, image), "rb") as img_f:
+                f.write(img_f.read())
 
-    # Now copy the images
-    for image in images:
-        data = open(os.path.join(images_path, image), "rb").read()
-        f.write(data)
 
-    f.close()
+def sanitize_path(path):
+    """Convert forward slashes to backslashes on Windows."""
+    if os.name == 'nt':
+        return path.replace('/', '\\')
+    return path
 
 
 def process_item(item_key, gpu, gpu_device_path):
     try:
-        data = plex.query('{}/tree'.format(item_key))
+        data = _worker_plex.query('{}/tree'.format(item_key))
     except (requests.exceptions.RequestException, http.client.BadStatusLine, xml.etree.ElementTree.ParseError) as e:
         logger.error(f"Failed to query Plex for item {item_key}: {e}")
         logger.error(f"Exception type: {type(e).__name__}")
@@ -472,16 +518,13 @@ def process_item(item_key, gpu, gpu_device_path):
         logger.error(f"Error querying Plex for item {item_key}: {e}")
         return
 
-    def sanitize_path(path):
-        if os.name == 'nt':
-            path = path.replace('/', '\\')
-        return path
-
     for media_part in data.findall('.//MediaPart'):
         if 'hash' in media_part.attrib:
             # Filter Processing by HDD Path
             if len(sys.argv) > 1:
-                if sys.argv[1] not in media_part.attrib['file']:
+                filter_path = os.path.normpath(sys.argv[1])
+                item_path = os.path.normpath(media_part.attrib['file'])
+                if not (item_path == filter_path or item_path.startswith(filter_path + os.sep)):
                     return
             bundle_hash = media_part.attrib['hash']
             media_file = sanitize_path(media_part.attrib['file'].replace(PLEX_VIDEOS_PATH_MAPPING, PLEX_LOCAL_VIDEOS_PATH_MAPPING))
@@ -491,7 +534,7 @@ def process_item(item_key, gpu, gpu_device_path):
                 continue
 
             try:
-                bundle_file = sanitize_path('{}/{}{}'.format(bundle_hash[0], bundle_hash[1::1], '.bundle'))
+                bundle_file = sanitize_path('{}/{}.bundle'.format(bundle_hash[0], bundle_hash[1:]))
             except Exception as e:
                 logger.error('Error generating bundle_file for {} due to {}:{}'.format(media_file, type(e).__name__, str(e)))
                 continue
@@ -606,33 +649,52 @@ def run(gpu, gpu_device_path):
         logger.info('Got {} media files for library {}'.format(len(media), section.title))
 
         with Progress(SpinnerColumn(), *Progress.get_default_columns(), MofNCompleteColumn(), console=console) as progress:
-            with ProcessPoolExecutor(max_workers=CPU_THREADS + GPU_THREADS) as process_pool:
-                futures = [process_pool.submit(process_item, key, gpu, gpu_device_path) for key in media]
-                for future in progress.track(futures):
-                    future.result()
+            with ProcessPoolExecutor(max_workers=CPU_THREADS + GPU_THREADS, initializer=_init_worker) as process_pool:
+                futures = {
+                    process_pool.submit(process_item, key, gpu, gpu_device_path): key
+                    for key in media
+                }
+                task = progress.add_task("Processing", total=len(futures))
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        key = futures[future]
+                        logger.error(f"Unhandled error processing {key}: {e}")
+                    progress.advance(task)
 
 
 if __name__ == '__main__':
     logger.info('GPU Detection (with AMD and INTEL Support) was recently added to this script.')
     logger.info('Please log issues here https://github.com/stevezau/plex_generate_vid_previews/issues')
 
+    if GPU_THREADS < 0:
+        logger.error(f"GPU_THREADS must be 0 or greater. Got: {GPU_THREADS}")
+        sys.exit(1)
+    if CPU_THREADS < 0:
+        logger.error(f"CPU_THREADS must be 0 or greater. Got: {CPU_THREADS}")
+        sys.exit(1)
+    if GPU_THREADS == 0 and CPU_THREADS == 0:
+        logger.error("GPU_THREADS and CPU_THREADS cannot both be 0. At least one worker is required.")
+        sys.exit(1)
+
     if not os.path.exists(PLEX_LOCAL_MEDIA_PATH):
         logger.error(
             '%s does not exist, please edit PLEX_LOCAL_MEDIA_PATH environment variable' % PLEX_LOCAL_MEDIA_PATH)
-        exit(1)
+        sys.exit(1)
 
     if not os.path.exists(os.path.join(PLEX_LOCAL_MEDIA_PATH, 'localhost')):
         logger.error(
             'You set PLEX_LOCAL_MEDIA_PATH to "%s". There should be a folder called "localhost" in that directory but it does not exist which suggests you haven\'t mapped it correctly. Please fix the PLEX_LOCAL_MEDIA_PATH environment variable' % PLEX_LOCAL_MEDIA_PATH)
-        exit(1)
+        sys.exit(1)
 
     if PLEX_URL == '':
         logger.error('Please set the PLEX_URL environment variable')
-        exit(1)
+        sys.exit(1)
 
     if PLEX_TOKEN == '':
         logger.error('Please set the PLEX_TOKEN environment variable')
-        exit(1)
+        sys.exit(1)
 
     # Output Debug info on variables
     logger.debug('PLEX_URL = {}'.format(PLEX_URL))
@@ -662,7 +724,13 @@ if __name__ == '__main__':
             logger.error(f'No GPUs detected but GPU_THREADS is set to {GPU_THREADS}.')
             logger.error('Please set the GPU_THREADS environment variable to 0 to use CPU-only processing.')
             logger.error('If you think this is an error please log an issue here https://github.com/stevezau/plex_generate_vid_previews/issues')
-            exit(1)
+            sys.exit(1)
+
+    # Initialize Plex connection in main process (after all validation)
+    plex = _create_plex_connection()
+
+    # Load cached heuristic probe results from previous runs
+    _load_heuristic_cache()
 
     try:
         # Clean TMP Folder

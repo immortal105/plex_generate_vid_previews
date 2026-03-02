@@ -1,0 +1,17 @@
+[project]
+name = "plex-generate-vid-previews"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "amdsmi==6.2.1",
+    "gpustat==1.1.1",
+    "loguru==0.7.2",
+    "plexapi==4.17.1",
+    "pymediainfo==6.1.0",
+    "pynvml==11.5.3",
+    "python-dotenv==1.0.1",
+    "requests==2.31.0",
+    "rich==13.7.1",
+]
