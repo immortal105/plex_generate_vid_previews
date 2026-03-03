@@ -11,8 +11,9 @@ import urllib3
 import array
 import time
 import http.client
-import xml.etree.ElementTree
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -71,6 +72,7 @@ except ImportError:
 
 try:
     from plexapi.server import PlexServer
+    import plexapi.utils as utils
 except ImportError:
     print('Dependencies Missing!  Please run "pip3 install plexapi".')
     sys.exit(1)
@@ -138,9 +140,6 @@ def _init_worker():
     _worker_plex = _create_plex_connection()
 
 # Monkey patch XML parsing to capture raw responses on parsing errors
-import plexapi.utils as utils
-import xml.etree.ElementTree as ET
-
 # Store the original function
 original_parseXMLString = utils.parseXMLString
 
@@ -150,7 +149,7 @@ def debug_parseXMLString(xml_string):
     except ET.ParseError as e:
         # Log the raw XML content for debugging
         logger.error(f"XML parsing failed with error: {e}")
-        logger.debug(f"Raw XML content (first 2000 chars):")
+        logger.debug("Raw XML content (first 2000 chars):")
         logger.debug(xml_string[:2000])
         if len(xml_string) > 2000:
             logger.debug(f"... (truncated, total length: {len(xml_string)})")
@@ -255,7 +254,7 @@ def get_amd_ffmpeg_processes():
     finally:
         try:
             amdsmi_shut_down()
-        except:
+        except Exception:
             pass  # Ignore shutdown errors if init failed
 
 def get_intel_ffmpeg_processes():
@@ -294,7 +293,8 @@ def _load_heuristic_cache():
     try:
         if _HEURISTIC_CACHE_PATH.exists():
             _heuristic_cache = json.loads(_HEURISTIC_CACHE_PATH.read_text())
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Could not load heuristic cache from {_HEURISTIC_CACHE_PATH}: {e}. Starting fresh.")
         _heuristic_cache = {}
 
 
@@ -302,8 +302,8 @@ def _save_heuristic_cache():
     """Persist heuristic probe results to disk."""
     try:
         _HEURISTIC_CACHE_PATH.write_text(json.dumps(_heuristic_cache))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to persist heuristic cache to {_HEURISTIC_CACHE_PATH}: {e}")
 
 
 def _heuristic_cache_key(video_file: str) -> str:
@@ -350,11 +350,10 @@ def heuristic_allows_skip(ffmpeg_path: str, video_file: str) -> bool:
         logger.debug("skip_frame probe OK at 0s")
 
     _heuristic_cache[key] = ok
-    _save_heuristic_cache()
     return ok
 
 
-def generate_images(video_file, output_folder, gpu, gpu_device_path):
+def generate_images(video_file: str, output_folder: str, gpu: Optional[str], gpu_device_path: Optional[str]) -> None:
     media_info = MediaInfo.parse(video_file)
     vf_parameters = "fps=fps={}:round=up,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(
         round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
@@ -397,18 +396,21 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
                 logger.debug('Hit limit on GPU threads, defaulting back to CPU')
 
             if len(gpu_ffmpeg) < GPU_THREADS or CPU_THREADS == 0:
-                hw = True
-                hwaccel_opts = ["-hwaccel", "vaapi", "-vaapi_device", gpu_device_path]
-                # Adjust vf_parameters for VAAPI hardware scaling
-                if gpu == 'INTEL':
-                    vf_parameters = vf_parameters.replace(
-                        "scale=w=320:h=240:force_original_aspect_ratio=decrease",
-                        "format=nv12,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease,hwdownload,format=nv12")
+                if gpu_device_path is None:
+                    logger.warning("VAAPI GPU detected but device path is None; falling back to CPU")
                 else:
-                    # AMD VAAPI
-                    vf_parameters = vf_parameters.replace(
-                        "scale=w=320:h=240:force_original_aspect_ratio=decrease",
-                        "format=nv12|vaapi,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease")
+                    hw = True
+                    hwaccel_opts = ["-hwaccel", "vaapi", "-vaapi_device", gpu_device_path]
+                    # Adjust vf_parameters for VAAPI hardware scaling
+                    if gpu == 'INTEL':
+                        vf_parameters = vf_parameters.replace(
+                            "scale=w=320:h=240:force_original_aspect_ratio=decrease",
+                            "format=nv12,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease,hwdownload,format=nv12")
+                    else:
+                        # AMD VAAPI
+                        vf_parameters = vf_parameters.replace(
+                            "scale=w=320:h=240:force_original_aspect_ratio=decrease",
+                            "format=nv12|vaapi,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease")
 
     use_skip = heuristic_allows_skip(FFMPEG_PATH, video_file)
     skip_opts = ["-skip_frame:v", "nokey"] if use_skip else []
@@ -420,7 +422,7 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
         + ["-i", video_file, "-an", "-sn", "-dn",
            "-q:v", str(THUMBNAIL_QUALITY),
            "-vf", vf_parameters,
-           '{}/img-%06d.jpg'.format(output_folder)]
+           str(Path(output_folder) / 'img-%06d.jpg')]
     )
 
     logger.debug('Running ffmpeg')
@@ -430,10 +432,10 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
     if proc.returncode != 0:
         err_lines = err.decode('utf-8', 'ignore').split('\n')[-5:]
         logger.error(err_lines)
-        logger.error('Problem trying to ffmpeg images for {}'.format(video_file))
+        raise RuntimeError('ffmpeg failed (rc={}) for {}'.format(proc.returncode, video_file))
 
     logger.debug('FFMPEG Command output')
-    logger.debug(out)
+    logger.debug(out.decode('utf-8', 'ignore'))
 
     # Speed
     end = time.time()
@@ -451,27 +453,32 @@ def generate_images(video_file, output_folder, gpu, gpu_device_path):
     logger.info('Generated Video Preview for {} HW={} TIME={}seconds SPEED={}x '.format(video_file, hw, seconds, speed))
 
 
-def generate_bif(bif_filename, images_path):
+def generate_bif(bif_filename: str, images_path: str) -> None:
     """
     Build a .bif file
     @param bif_filename name of .bif file to create
     @param images_path Directory of image files 00000001.jpg
     """
-    magic = [0x89, 0x42, 0x49, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]
-    version = 0
+    # BIF format constants (https://web.archive.org/web/20200301/https://github.com/nickelc/bif-spec)
+    BIF_MAGIC = [0x89, 0x42, 0x49, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]
+    BIF_VERSION = 0
+    BIF_HEADER_SIZE = 64          # Total header size in bytes
+    BIF_RESERVED_START = 20       # Offset where zero-padding begins (after 5 × 4-byte fields)
+    BIF_INDEX_ENTRY_SIZE = 8      # 4 bytes timestamp + 4 bytes absolute offset per entry
+    BIF_END_OF_INDEX = 0xffffffff # Sentinel value marking end of index table
 
     images = [img for img in os.listdir(images_path) if os.path.splitext(img)[1] == '.jpg']
     images.sort()
 
     with open(bif_filename, "wb") as f:
-        array.array('B', magic).tofile(f)
-        f.write(struct.pack("<I", version))
+        array.array('B', BIF_MAGIC).tofile(f)
+        f.write(struct.pack("<I", BIF_VERSION))
         f.write(struct.pack("<I", len(images)))
         f.write(struct.pack("<I", 1000 * PLEX_BIF_FRAME_INTERVAL))
-        array.array('B', [0x00 for x in range(20, 64)]).tofile(f)
+        array.array('B', [0x00] * (BIF_HEADER_SIZE - BIF_RESERVED_START)).tofile(f)
 
-        bif_table_size = 8 + (8 * len(images))
-        image_index = 64 + bif_table_size
+        bif_table_size = BIF_INDEX_ENTRY_SIZE + (BIF_INDEX_ENTRY_SIZE * len(images))
+        image_index = BIF_HEADER_SIZE + bif_table_size
         timestamp = 0
 
         # Get the length of each image
@@ -482,7 +489,7 @@ def generate_bif(bif_filename, images_path):
             timestamp += 1
             image_index += statinfo.st_size
 
-        f.write(struct.pack("<I", 0xffffffff))
+        f.write(struct.pack("<I", BIF_END_OF_INDEX))
         f.write(struct.pack("<I", image_index))
 
         # Now copy the images
@@ -491,28 +498,30 @@ def generate_bif(bif_filename, images_path):
                 f.write(img_f.read())
 
 
-def sanitize_path(path):
+def sanitize_path(path: str) -> str:
     """Convert forward slashes to backslashes on Windows."""
     if os.name == 'nt':
         return path.replace('/', '\\')
     return path
 
 
-def process_item(item_key, gpu, gpu_device_path):
+def process_item(item_key: str, gpu: Optional[str], gpu_device_path: Optional[str]) -> None:
     try:
         data = _worker_plex.query('{}/tree'.format(item_key))
-    except (requests.exceptions.RequestException, http.client.BadStatusLine, xml.etree.ElementTree.ParseError) as e:
+    except (requests.exceptions.RequestException, http.client.BadStatusLine, ET.ParseError) as e:
         logger.error(f"Failed to query Plex for item {item_key}: {e}")
         logger.error(f"Exception type: {type(e).__name__}")
         # For XML parsing errors, provide additional context
-        if isinstance(e, xml.etree.ElementTree.ParseError):
-            logger.error(f"XML parsing error - Plex server returned malformed XML response")
-            logger.error(f"This usually indicates server issues, network problems, or corrupted responses")
+        if isinstance(e, ET.ParseError):
+            logger.error("XML parsing error - Plex server returned malformed XML response")
+            logger.error("This usually indicates server issues, network problems, or corrupted responses")
         # For connection errors, log more details
         elif hasattr(e, 'request') and e.request:
             logger.error(f"Request URL: {e.request.url}")
             logger.error(f"Request method: {e.request.method}")
-            logger.error(f"Request headers: {e.request.headers}")
+            safe_headers = {k: v for k, v in e.request.headers.items()
+                            if 'token' not in k.lower() and 'auth' not in k.lower()}
+            logger.error(f"Request headers (sensitive values redacted): {safe_headers}")
         return
     except Exception as e:
         logger.error(f"Error querying Plex for item {item_key}: {e}")
@@ -525,7 +534,7 @@ def process_item(item_key, gpu, gpu_device_path):
                 filter_path = os.path.normpath(sys.argv[1])
                 item_path = os.path.normpath(media_part.attrib['file'])
                 if not (item_path == filter_path or item_path.startswith(filter_path + os.sep)):
-                    return
+                    continue
             bundle_hash = media_part.attrib['hash']
             media_file = sanitize_path(media_part.attrib['file'].replace(PLEX_VIDEOS_PATH_MAPPING, PLEX_LOCAL_VIDEOS_PATH_MAPPING))
 
@@ -590,11 +599,11 @@ def process_item(item_key, gpu, gpu_device_path):
                         shutil.rmtree(tmp_path)
 
 
-def filter_duplicate_locations(media_items):
+def filter_duplicate_locations(media_items: list) -> list:
     seen_locations = set()
     filtered_items = []
     
-    for key, locations in media_items:            
+    for key, locations in media_items:
         # Check if any location has been seen before
         if any(location in seen_locations for location in locations):
             continue
@@ -606,15 +615,15 @@ def filter_duplicate_locations(media_items):
     return filtered_items
 
 
-def run(gpu, gpu_device_path):
+def run(gpu: Optional[str], gpu_device_path: Optional[str]) -> None:
     try:
         sections = plex.library.sections()
-    except (requests.exceptions.RequestException, http.client.BadStatusLine, xml.etree.ElementTree.ParseError) as e:
+    except (requests.exceptions.RequestException, http.client.BadStatusLine, ET.ParseError) as e:
         logger.error(f"Failed to get Plex library sections: {e}")
         logger.error(f"Exception type: {type(e).__name__}")
-        if isinstance(e, xml.etree.ElementTree.ParseError):
-            logger.error(f"XML parsing error - Plex server returned malformed XML response")
-            logger.error(f"This usually indicates server issues, network problems, or corrupted responses")
+        if isinstance(e, ET.ParseError):
+            logger.error("XML parsing error - Plex server returned malformed XML response")
+            logger.error("This usually indicates server issues, network problems, or corrupted responses")
         logger.error("Cannot proceed without library access. Please check your Plex server status.")
         return
     
@@ -637,10 +646,10 @@ def run(gpu, gpu_device_path):
             else:
                 logger.info('Skipping library {} as \'{}\' is unsupported'.format(section.title, section.METADATA_TYPE))
                 continue
-        except (requests.exceptions.RequestException, http.client.BadStatusLine, xml.etree.ElementTree.ParseError) as e:
+        except (requests.exceptions.RequestException, http.client.BadStatusLine, ET.ParseError) as e:
             logger.error(f"Failed to search library '{section.title}': {e}")
             logger.error(f"Exception type: {type(e).__name__}")
-            if isinstance(e, xml.etree.ElementTree.ParseError):
+            if isinstance(e, ET.ParseError):
                 logger.error(f"XML parsing error - Plex server returned malformed XML response")
                 logger.error(f"This usually indicates server issues, network problems, or corrupted responses")
             logger.warning(f"Skipping library '{section.title}' due to error")
@@ -741,3 +750,5 @@ if __name__ == '__main__':
     finally:
         if os.path.isdir(TMP_FOLDER):
             shutil.rmtree(TMP_FOLDER)
+        # Persist heuristic cache once after all workers finish (safe — main process only)
+        _save_heuristic_cache()
